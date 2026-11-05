@@ -1,0 +1,1189 @@
+#!/usr/bin/env bash
+# AppImage auto-installer for ~/Apps
+# Choice of watcher: inotifywait (inotify-tools). It is a small dedicated C tool
+# with close_write/moved_to/delete events, no extra Python deps, and it behaves
+# well as a long-running systemd process. A 2s poll loop is the fallback.
+set -u
+umask 022
+
+VERSION="1.0.0"
+
+readonly HOME_DIR="${HOME}"
+WATCH_DIR="${WATCH_DIR:-${HOME_DIR}/Apps}"
+CONFIG_FILE="${APPIMAGE_WATCHER_CONFIG:-${HOME_DIR}/.config/appimage-watcher/config}"
+STATE_DIR="${HOME_DIR}/.local/state/appimage-watcher"
+LOG_FILE="${STATE_DIR}/log"
+STATE_FILE="${STATE_DIR}/state.tsv"
+LOCK_FILE="${STATE_DIR}/watcher.lock"
+WORK_ROOT="${STATE_DIR}/work"
+DESKTOP_DIR="${HOME_DIR}/.local/share/applications"
+ICON_THEME_DIR="${HOME_DIR}/.local/share/icons/hicolor"
+STABLE_SECONDS="${STABLE_SECONDS:-3}"
+SMOKE_TEST="${SMOKE_TEST:-0}"
+INSTALL_DEPS="${INSTALL_DEPS:-1}"
+
+COMMON_PKGS=(fuse-libs gtk3 nss alsa-lib libXScrnSaver mesa-libGL xdg-utils)
+
+# Maps soname -> Fedora package. Checked before `dnf provides`.
+declare -A SO_TO_PKG=(
+  [libfuse.so.2]=fuse-libs
+  [libfuse.so.0]=fuse-libs
+  [libgtk-3.so.0]=gtk3
+  [libgdk-3.so.0]=gtk3
+  [libgtk-4.so.1]=gtk4
+  [libnss3.so]=nss
+  [libnssutil3.so]=nss
+  [libsmime3.so]=nss
+  [libnspr4.so]=nspr
+  [libasound.so.2]=alsa-lib
+  [libXss.so.1]=libXScrnSaver
+  [libGL.so.1]=mesa-libGL
+  [libEGL.so.1]=mesa-libEGL
+  [libgbm.so.1]=mesa-libgbm
+  [libOpenGL.so.0]=libglvnd
+  [libGLdispatch.so.0]=libglvnd
+  [libGLX.so.0]=libglvnd
+  [libX11.so.6]=libX11
+  [libXcomposite.so.1]=libXcomposite
+  [libXdamage.so.1]=libXdamage
+  [libXext.so.6]=libXext
+  [libXfixes.so.3]=libXfixes
+  [libXrandr.so.2]=libXrandr
+  [libXi.so.6]=libXi
+  [libXrender.so.1]=libXrender
+  [libXcursor.so.1]=libXcursor
+  [libXtst.so.6]=libXtst
+  [libxkbcommon.so.0]=libxkbcommon
+  [libdrm.so.2]=libdrm
+  [libcups.so.2]=cups-libs
+  [libdbus-1.so.3]=dbus-libs
+  [libatk-1.0.so.0]=atk
+  [libatk-bridge-2.0.so.0]=at-spi2-atk
+  [libatspi.so.0]=at-spi2-core
+  [libcairo.so.2]=cairo
+  [libpango-1.0.so.0]=pango
+  [libsecret-1.so.0]=libsecret
+  [libnotify.so.4]=libnotify
+  [libcanberra.so.0]=libcanberra
+  [libva.so.2]=libva
+  [libvulkan.so.1]=vulkan-loader
+  [libwayland-client.so.0]=libwayland-client
+  [libpipewire-0.3.so.0]=pipewire-libs
+)
+
+ALLOWED_DESKTOP_PREFIX="${DESKTOP_DIR}/appimage-"
+ALLOWED_ICON_PREFIX="${HOME_DIR}/.local/share/icons/"
+
+mkdir -p "${STATE_DIR}" "${WORK_ROOT}" "${WATCH_DIR}" "${DESKTOP_DIR}" \
+  "${ICON_THEME_DIR}" "$(dirname "${CONFIG_FILE}")"
+
+# ---------------------------------------------------------------------------
+# Logging / notifications
+# ---------------------------------------------------------------------------
+
+log() {
+  local level="$1"; shift
+  local line
+  line="$(date -Iseconds) [${level}] $*"
+  printf '%s\n' "${line}" >>"${LOG_FILE}"
+  printf '%s\n' "${line}"
+}
+
+rotate_log() {
+  [[ -f "${LOG_FILE}" ]] || return 0
+  local size
+  size="$(stat -c %s "${LOG_FILE}" 2>/dev/null || echo 0)"
+  if (( size > 5242880 )); then
+    mv -f "${LOG_FILE}" "${LOG_FILE}.1"
+  fi
+}
+
+notify() {
+  local title="$1"; shift
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "AppImage Watcher" -i application-x-executable \
+      "${title}" "$*" >/dev/null 2>&1 || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+load_config() {
+  [[ -f "${CONFIG_FILE}" ]] || return 0
+  local line key val
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line}" ]] && continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    case "${key}" in
+      WATCH_DIR) WATCH_DIR="${val/#\~/${HOME_DIR}}" ;;
+      STABLE_SECONDS) STABLE_SECONDS="${val}" ;;
+      SMOKE_TEST) SMOKE_TEST="${val}" ;;
+      INSTALL_DEPS) INSTALL_DEPS="${val}" ;;
+      LOG_FILE) LOG_FILE="${val/#\~/${HOME_DIR}}" ;;
+    esac
+  done <"${CONFIG_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+is_partial_name() {
+  local base="$1"
+  local lower="${base,,}"
+  [[ "${base}" == .* ]] && return 0
+  [[ "${lower}" == *.part ]] && return 0
+  [[ "${lower}" == *.crdownload ]] && return 0
+  [[ "${lower}" == *.tmp ]] && return 0
+  [[ "${lower}" == *.download ]] && return 0
+  [[ "${lower}" == *.partial ]] && return 0
+  [[ "${lower}" == *.filepart ]] && return 0
+  [[ "${lower}" == *~ ]] && return 0
+  return 1
+}
+
+is_appimage_name() {
+  local base="$1"
+  [[ "${base,,}" == *.appimage ]]
+}
+
+realpath_safe() {
+  local p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -e "$p" 2>/dev/null || realpath "$p" 2>/dev/null || printf '%s\n' "$p"
+  else
+    readlink -f "$p" 2>/dev/null || printf '%s\n' "$p"
+  fi
+}
+
+path_inside_dir() {
+  local path="$1" dir="$2"
+  local rp rd
+  rp="$(realpath_safe "${path}")"
+  rd="$(realpath_safe "${dir}")"
+  [[ "${rp}" == "${rd}" || "${rp}" == "${rd}/"* ]]
+}
+
+wait_until_stable() {
+  local f="$1"
+  local last=-1 same=0 waited=0
+  local max=120
+  while (( waited < max )); do
+    [[ -f "${f}" ]] || return 1
+    is_partial_name "$(basename "${f}")" && { sleep 1; waited=$((waited + 1)); continue; }
+    local sz
+    sz="$(stat -c %s "${f}" 2>/dev/null || echo 0)"
+    if [[ "${sz}" == "${last}" ]] && (( sz > 0 )); then
+      same=$((same + 1))
+      if (( same >= STABLE_SECONDS )); then
+        return 0
+      fi
+    else
+      same=0
+      last="${sz}"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  log warn "file did not stabilize in ${max}s: ${f}"
+  return 1
+}
+
+slugify() {
+  local s="${1,,}"
+  s="${s//[^a-z0-9._+-]/-}"
+  s="$(printf '%s' "${s}" | sed -E 's/-+/-/g; s/^-+//; s/-+$//')"
+  [[ -n "${s}" ]] || s="app"
+  printf '%s\n' "${s}"
+}
+
+humanize_stem() {
+  local s="$1"
+  s="${s//_/ }"
+  s="${s//-/ }"
+  printf '%s\n' "${s}"
+}
+
+stem_without_version() {
+  local stem="$1"
+  stem="${stem%.AppImage}"
+  stem="${stem%.appimage}"
+  stem="${stem%.APPIMAGE}"
+  stem="$(printf '%s' "${stem}" | sed -E \
+    's/-(x86_64|amd64|x86-64|aarch64|arm64|i[3-6]86|armhf|armv7l)$//I;
+     s/[-_](v?[0-9]+([._-][0-9]+){0,4}([-.][A-Za-z0-9]+)*)$//')"
+  printf '%s\n' "${stem}"
+}
+
+appimage_type() {
+  python3 - "$1" <<'PY'
+import sys
+path = sys.argv[1]
+try:
+    with open(path, "rb") as f:
+        data = f.read(16)
+except OSError:
+    print("unknown")
+    raise SystemExit
+if data[:4] != b"\x7fELF":
+    print("unknown")
+    raise SystemExit
+if data[8:10] == b"AI" and data[10] in (1, 2):
+    print(int(data[10]))
+else:
+    print("unknown")
+PY
+}
+
+has_libfuse2() {
+  [[ -e /usr/lib64/libfuse.so.2 || -e /lib64/libfuse.so.2 ]] && return 0
+  ldconfig -p 2>/dev/null | grep -q 'libfuse\.so\.2' && return 0
+  return 1
+}
+
+pkg_installed() {
+  rpm -q "$1" >/dev/null 2>&1
+}
+
+selinux_enforcing() {
+  [[ "$(getenforce 2>/dev/null || echo Disabled)" == "Enforcing" ]]
+}
+
+restore_selinux_label() {
+  local f="$1"
+  selinux_enforcing || return 0
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon -F "${f}" >/dev/null 2>&1 || true
+    log info "SELinux: restorecon $(ls -Z "${f}" 2>/dev/null | awk '{print $1}') ${f}"
+  fi
+}
+
+quote_exec_path() {
+  local p="$1"
+  p="${p//\"/\\\"}"
+  printf '"%s"' "${p}"
+}
+
+# ---------------------------------------------------------------------------
+# State: path<TAB>app_id<TAB>size<TAB>mtime<TAB>desktop<TAB>icons
+# ---------------------------------------------------------------------------
+
+state_lines() {
+  [[ -f "${STATE_FILE}" ]] || return 0
+  grep -v '^#' "${STATE_FILE}" | grep -v '^[[:space:]]*$' || true
+}
+
+state_write_all() {
+  local tmp
+  tmp="$(mktemp "${STATE_FILE}.XXXXXX")"
+  printf '# path\tapp_id\tsize\tmtime\tdesktop\ticons\n' >"${tmp}"
+  cat >>"${tmp}"
+  mv -f "${tmp}" "${STATE_FILE}"
+}
+
+state_upsert() {
+  local path="$1" app_id="$2" size="$3" mtime="$4" desktop="$5" icons="$6"
+  {
+    state_lines | awk -F'\t' -v p="${path}" '$1 != p {print}'
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${path}" "${app_id}" "${size}" "${mtime}" "${desktop}" "${icons}"
+  } | state_write_all
+}
+
+state_delete_path() {
+  local path="$1"
+  state_lines | awk -F'\t' -v p="${path}" '$1 != p {print}' | state_write_all
+}
+
+state_paths_for_app() {
+  local app_id="$1"
+  state_lines | awk -F'\t' -v a="${app_id}" '$2 == a {print $1}'
+}
+
+# ---------------------------------------------------------------------------
+# Package install (pkexec)
+# ---------------------------------------------------------------------------
+
+install_packages() {
+  local pkgs=("$@")
+  local need=() p
+  (( ${#pkgs[@]} )) || return 0
+  [[ "${INSTALL_DEPS}" == "1" ]] || { log info "INSTALL_DEPS=0, skipping: ${pkgs[*]}"; return 0; }
+
+  for p in "${pkgs[@]}"; do
+    if ! pkg_installed "${p}"; then
+      need+=("${p}")
+    fi
+  done
+  (( ${#need[@]} )) || return 0
+
+  log info "need packages: ${need[*]}"
+  notify "Installing AppImage dependencies" "Need administrator approval for: ${need[*]}"
+
+  local rc=0
+  if command -v pkexec >/dev/null 2>&1; then
+    pkexec /usr/bin/dnf install -y "${need[@]}" || rc=$?
+  else
+    log error "pkexec not available; cannot install: ${need[*]}"
+    notify "AppImage dependencies missing" "Install manually: sudo dnf install ${need[*]}"
+    return 1
+  fi
+
+  if (( rc != 0 )); then
+    log error "dnf install failed (exit ${rc}): ${need[*]}"
+    notify "Package install failed" "Could not install: ${need[*]}"
+    return 1
+  fi
+
+  local still=()
+  for p in "${need[@]}"; do
+    pkg_installed "${p}" || still+=("${p}")
+  done
+  if (( ${#still[@]} )); then
+    log error "packages still missing after dnf: ${still[*]}"
+    notify "Package install incomplete" "Still missing: ${still[*]}"
+    return 1
+  fi
+
+  log info "installed packages: ${need[*]}"
+  notify "AppImage dependencies installed" "${need[*]}"
+  return 0
+}
+
+map_soname_to_pkg() {
+  local so="$1"
+  local pkg="${SO_TO_PKG[$so]:-}"
+  if [[ -n "${pkg}" ]]; then
+    printf '%s\n' "${pkg}"
+    return 0
+  fi
+  local out
+  out="$(timeout 20 dnf repoquery --whatprovides "*/${so}" --qf '%{name}\n' 2>/dev/null | grep -v '^$' | head -n 1 || true)"
+  if [[ -z "${out}" ]]; then
+    out="$(timeout 20 dnf provides "*/${so}" 2>/dev/null | awk '/^\S/{print $1; exit}' | sed -E 's/-[0-9].*//' || true)"
+  fi
+  [[ -n "${out}" ]] && printf '%s\n' "${out}"
+}
+
+# ---------------------------------------------------------------------------
+# Extract + missing libs
+# ---------------------------------------------------------------------------
+
+extract_appimage() {
+  local appimage="$1" dest="$2"
+  mkdir -p "${dest}"
+  local rc=0
+  (cd "${dest}" && timeout 180 "${appimage}" --appimage-extract >/dev/null) || rc=$?
+  if [[ ! -d "${dest}/squashfs-root" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+find_root_desktops() {
+  local root="$1"
+  local d
+  shopt -s nullglob
+  local files=("${root}"/*.desktop)
+  shopt -u nullglob
+  if (( ${#files[@]} )); then
+    printf '%s\n' "${files[@]}"
+    return 0
+  fi
+  find "${root}" -maxdepth 3 -name '*.desktop' -type f 2>/dev/null | head -n 5
+}
+
+png_size() {
+  local f="$1"
+  python3 - "$f" <<'PY'
+import struct, sys
+path = sys.argv[1]
+try:
+    with open(path, "rb") as fh:
+        sig = fh.read(24)
+    if sig[:8] == b"\x89PNG\r\n\x1a\n":
+        w, h = struct.unpack(">II", sig[16:24])
+        print(f"{w}x{h}")
+    else:
+        print("unknown")
+except Exception:
+    print("unknown")
+PY
+}
+
+collect_missing_libs() {
+  local root="$1"
+  local main="$2"
+  local libpath=""
+  local dir
+  while IFS= read -r dir; do
+    libpath="${libpath}${libpath:+:}${dir}"
+  done < <(find "${root}" \( -name '*.so' -o -name '*.so.*' \) -printf '%h\n' 2>/dev/null | sort -u)
+
+  local targets=()
+  [[ -f "${main}" ]] && targets+=("${main}")
+  local extra
+  while IFS= read -r extra; do
+    targets+=("${extra}")
+  done < <(find "${root}" -maxdepth 2 \( -name '*.so' -o -name 'chrome-sandbox' -o -name '*.bin' \) -type f 2>/dev/null | head -n 40)
+
+  local missing=()
+  local t line so
+  for t in "${targets[@]}"; do
+    [[ -f "${t}" ]] || continue
+    file -b "${t}" 2>/dev/null | grep -q ELF || continue
+    while IFS= read -r line; do
+      [[ "${line}" == *"not found"* ]] || continue
+      so="$(awk '{print $1}' <<<"${line}")"
+      [[ -n "${so}" ]] || continue
+      if find "${root}" -name "${so}" -print -quit 2>/dev/null | grep -q .; then
+        continue
+      fi
+      missing+=("${so}")
+    done < <(LD_LIBRARY_PATH="${libpath}${libpath:+:}${root}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ldd "${t}" 2>/dev/null || true)
+  done
+
+  if (( ${#missing[@]} )); then
+    printf '%s\n' "${missing[@]}" | sort -u
+  fi
+}
+
+detect_electron() {
+  local root="$1" desktop="$2"
+  [[ -e "${root}/chrome-sandbox" ]] && return 0
+  grep -qi 'electron\|--no-sandbox' "${root}/AppRun" 2>/dev/null && return 0
+  [[ -n "${desktop}" ]] && grep -qi electron "${desktop}" 2>/dev/null && return 0
+  local bin
+  bin="$(find "${root}" -maxdepth 1 -type f -executable ! -name 'AppRun' | head -n 1)"
+  if [[ -n "${bin}" ]] && file -b "${bin}" 2>/dev/null | grep -q ELF; then
+    strings "${bin}" 2>/dev/null | grep -q 'Electron' && return 0
+  fi
+  return 1
+}
+
+user_ns_ok() {
+  unshare -Ur true >/dev/null 2>&1
+}
+
+find_main_binary() {
+  local root="$1" desktop="$2"
+  if [[ -f "${root}/AppRun" ]] && file -b "${root}/AppRun" 2>/dev/null | grep -q ELF; then
+    printf '%s\n' "${root}/AppRun"
+    return 0
+  fi
+  if [[ -n "${desktop}" && -f "${desktop}" ]]; then
+    local exec_bin
+    exec_bin="$(awk -F= '/^\[Desktop Entry\]/{inside=1; next} /^\[/{inside=0} inside && /^Exec=/{sub(/^Exec=/,""); print; exit}' "${desktop}")"
+    exec_bin="${exec_bin%% *}"
+    exec_bin="${exec_bin//\"/}"
+    if [[ -n "${exec_bin}" && "${exec_bin}" != /* && -e "${root}/${exec_bin}" ]]; then
+      printf '%s\n' "${root}/${exec_bin}"
+      return 0
+    fi
+    if [[ -e "${root}/$(basename "${exec_bin}")" ]]; then
+      printf '%s\n' "${root}/$(basename "${exec_bin}")"
+      return 0
+    fi
+  fi
+  if [[ -L "${root}/AppRun" ]]; then
+    realpath_safe "${root}/AppRun"
+    return 0
+  fi
+  find "${root}" -maxdepth 1 -type f -executable ! -name 'AppRun' | head -n 1
+}
+
+# ---------------------------------------------------------------------------
+# Desktop / icon integration
+# ---------------------------------------------------------------------------
+
+rewrite_desktop() {
+  local src="$1" dest="$2" exec_line="$3" icon_name="$4" tryexec="$5"
+  python3 - "${src}" "${dest}" "${exec_line}" "${icon_name}" "${tryexec}" <<'PY'
+import pathlib, sys
+src, dest, exec_line, icon_name, tryexec = sys.argv[1:6]
+text = pathlib.Path(src).read_text(encoding="utf-8", errors="replace") if src and pathlib.Path(src).is_file() else ""
+if not text.strip():
+    text = "[Desktop Entry]\nType=Application\n"
+
+def extras(seen):
+    extra = []
+    if not seen["Type"]:
+        extra.append("Type=Application")
+    if not seen["Exec"]:
+        extra.append("Exec=" + exec_line)
+    if not seen["Icon"]:
+        extra.append("Icon=" + icon_name)
+    if not seen["TryExec"]:
+        extra.append("TryExec=" + tryexec)
+    if not seen["Terminal"]:
+        extra.append("Terminal=false")
+    if not seen["DBusActivatable"]:
+        extra.append("DBusActivatable=false")
+    if not seen["X-AppImage-Watcher"]:
+        extra.append("X-AppImage-Watcher=1")
+    if not seen["X-AppImage-Path"]:
+        extra.append("X-AppImage-Path=" + tryexec)
+    return extra
+
+lines = text.splitlines()
+out = []
+in_entry = False
+seen = {k: False for k in ("Exec", "Icon", "TryExec", "Terminal", "Type", "DBusActivatable", "X-AppImage-Watcher", "X-AppImage-Path")}
+wrote_header = False
+
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if in_entry:
+            out.extend(extras(seen))
+            in_entry = False
+        in_entry = stripped == "[Desktop Entry]"
+        if in_entry:
+            wrote_header = True
+        out.append(line)
+        continue
+    if in_entry and "=" in line and not stripped.startswith("#"):
+        key = line.split("=", 1)[0]
+        if key == "Exec":
+            out.append("Exec=" + exec_line)
+            seen["Exec"] = True
+            continue
+        if key == "Icon":
+            out.append("Icon=" + icon_name)
+            seen["Icon"] = True
+            continue
+        if key == "TryExec":
+            out.append("TryExec=" + tryexec)
+            seen["TryExec"] = True
+            continue
+        if key == "DBusActivatable":
+            out.append("DBusActivatable=false")
+            seen["DBusActivatable"] = True
+            continue
+        if key == "X-AppImage-Watcher":
+            out.append("X-AppImage-Watcher=1")
+            seen["X-AppImage-Watcher"] = True
+            continue
+        if key == "X-AppImage-Path":
+            out.append("X-AppImage-Path=" + tryexec)
+            seen["X-AppImage-Path"] = True
+            continue
+        if key in seen:
+            seen[key] = True
+    out.append(line)
+
+if in_entry:
+    out.extend(extras(seen))
+if not wrote_header:
+    out = ["[Desktop Entry]"] + extras(seen) + out
+
+pathlib.Path(dest).write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+}
+
+install_icons() {
+  local root="$1" icon_key="$2" dest_name="$3"
+  local installed=()
+  local found=0
+  local f size dest
+
+  if [[ -n "${icon_key}" ]]; then
+    while IFS= read -r f; do
+      [[ -f "${f}" ]] || continue
+      found=1
+      case "${f,,}" in
+        *.svg)
+          dest="${ICON_THEME_DIR}/scalable/apps/${dest_name}.svg"
+          mkdir -p "$(dirname "${dest}")"
+          cp -f "${f}" "${dest}"
+          installed+=("${dest}")
+          ;;
+        *.png|*.xpm)
+          size="$(png_size "${f}")"
+          if [[ "${size}" != unknown && "${size}" == *x* ]]; then
+            local dim="${size%%x*}"
+            dest="${ICON_THEME_DIR}/${dim}x${dim}/apps/${dest_name}.png"
+          else
+            # try hicolor path in the source
+            if [[ "${f}" =~ /hicolor/([^/]+)/apps/ ]]; then
+              dest="${ICON_THEME_DIR}/${BASH_REMATCH[1]}/apps/${dest_name}.png"
+            else
+              dest="${ICON_THEME_DIR}/256x256/apps/${dest_name}.png"
+            fi
+          fi
+          mkdir -p "$(dirname "${dest}")"
+          cp -f "${f}" "${dest}"
+          installed+=("${dest}")
+          ;;
+      esac
+    done < <(find "${root}" \( -path "*/icons/hicolor/*/apps/${icon_key}.png" \
+                            -o -path "*/icons/hicolor/*/apps/${icon_key}.svg" \
+                            -o -path "*/pixmaps/${icon_key}.png" \
+                            -o -path "*/pixmaps/${icon_key}.svg" \
+                            -o -name "${icon_key}.png" \
+                            -o -name "${icon_key}.svg" \) -type f 2>/dev/null | sort)
+  fi
+
+  if (( found == 0 )); then
+    local fallback
+    fallback="$(find -L "${root}" -path '*/icons/hicolor/*/apps/*' \( -name '*.png' -o -name '*.svg' \) 2>/dev/null | sort | tail -n 1)"
+    [[ -n "${fallback}" ]] || fallback="$(find -L "${root}" -maxdepth 2 \( -name '.DirIcon' -o -name '*.png' \) 2>/dev/null | head -n 1)"
+    if [[ -n "${fallback}" ]]; then
+      size="$(png_size "${fallback}")"
+      local dim="256"
+      [[ "${size}" == *x* ]] && dim="${size%%x*}"
+      dest="${ICON_THEME_DIR}/${dim}x${dim}/apps/${dest_name}.png"
+      mkdir -p "$(dirname "${dest}")"
+      cp -f "${fallback}" "${dest}"
+      installed+=("${dest}")
+    fi
+  fi
+
+  if (( ${#installed[@]} )); then
+    printf '%s\n' "${installed[@]}" | sort -u | paste -sd: -
+  fi
+}
+
+refresh_desktop_and_icons() {
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "${DESKTOP_DIR}" >/dev/null 2>&1 || true
+  fi
+  if [[ ! -f "${ICON_THEME_DIR}/index.theme" && -f /usr/share/icons/hicolor/index.theme ]]; then
+    cp /usr/share/icons/hicolor/index.theme "${ICON_THEME_DIR}/index.theme"
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "${ICON_THEME_DIR}" >/dev/null 2>&1 || true
+  fi
+  if command -v xdg-desktop-menu >/dev/null 2>&1; then
+    xdg-desktop-menu forceupdate >/dev/null 2>&1 || true
+  fi
+}
+
+safe_rm() {
+  local f="$1"
+  [[ -n "${f}" ]] || return 0
+  if [[ "${f}" == "${ALLOWED_DESKTOP_PREFIX}"* && "${f}" == *.desktop ]]; then
+    rm -f "${f}"
+    return 0
+  fi
+  if [[ "${f}" == "${ALLOWED_ICON_PREFIX}"* ]]; then
+    rm -f "${f}"
+    return 0
+  fi
+  log warn "refusing to delete outside allowed dirs: ${f}"
+  return 1
+}
+
+remove_app_integration() {
+  local app_id="$1"
+  local extra_icons="${2:-}"
+  local desktop="${DESKTOP_DIR}/appimage-${app_id}.desktop"
+  local line ic
+  while IFS= read -r line; do
+    local d i
+    d="$(awk -F'\t' '{print $5}' <<<"${line}")"
+    i="$(awk -F'\t' '{print $6}' <<<"${line}")"
+    [[ -n "${d}" ]] && safe_rm "${d}"
+    IFS=':' read -ra icon_arr <<<"${i}"
+    for ic in "${icon_arr[@]}"; do
+      [[ -n "${ic}" ]] && safe_rm "${ic}"
+    done
+  done < <(state_lines | awk -F'\t' -v a="${app_id}" '$2 == a {print}')
+  IFS=':' read -ra icon_arr <<<"${extra_icons}"
+  for ic in "${icon_arr[@]}"; do
+    [[ -n "${ic}" ]] && safe_rm "${ic}"
+  done
+  # Glob our well-known names so icons still go away if state was already cleared.
+  local f
+  shopt -s nullglob
+  for f in \
+    "${ICON_THEME_DIR}"/*/apps/appimage-"${app_id}".* \
+    "${ICON_THEME_DIR}"/scalable/apps/appimage-"${app_id}".*
+  do
+    safe_rm "${f}"
+  done
+  shopt -u nullglob
+  safe_rm "${desktop}"
+  log info "removed desktop integration for ${app_id}"
+}
+
+# ---------------------------------------------------------------------------
+# Process one AppImage
+# ---------------------------------------------------------------------------
+
+process_appimage() {
+  local appimage="$1"
+  local base size mtime
+  base="$(basename "${appimage}")"
+  is_appimage_name "${base}" || { log info "skip non-AppImage: ${base}"; return 0; }
+  is_partial_name "${base}" && { log info "skip partial: ${base}"; return 0; }
+  [[ -f "${appimage}" ]] || return 0
+
+  if ! path_inside_dir "${appimage}" "${WATCH_DIR}"; then
+    log warn "skip path outside ${WATCH_DIR}: ${appimage}"
+    return 0
+  fi
+
+  chmod +x "${appimage}" || { log error "chmod +x failed: ${appimage}"; return 1; }
+  restore_selinux_label "${appimage}"
+
+  size="$(stat -c %s "${appimage}")"
+  mtime="$(stat -c %Y "${appimage}")"
+
+  local cached
+  cached="$(state_lines | awk -F'\t' -v p="${appimage}" '$1 == p {print; exit}')"
+  if [[ -n "${cached}" ]]; then
+    local c_size c_mtime c_desktop
+    c_size="$(awk -F'\t' '{print $3}' <<<"${cached}")"
+    c_mtime="$(awk -F'\t' '{print $4}' <<<"${cached}")"
+    c_desktop="$(awk -F'\t' '{print $5}' <<<"${cached}")"
+    if [[ "${c_size}" == "${size}" && "${c_mtime}" == "${mtime}" && -f "${c_desktop}" ]]; then
+      if grep -Fq "${appimage}" "${c_desktop}" 2>/dev/null; then
+        log info "already integrated (unchanged): ${base}"
+        return 0
+      fi
+    fi
+  fi
+
+  local ai_type
+  ai_type="$(appimage_type "${appimage}")"
+  log info "processing ${base} (type ${ai_type}, ${size} bytes)"
+
+  local fuse_fallback=0
+  if [[ "${ai_type}" == "2" ]]; then
+    if ! has_libfuse2; then
+      log info "type 2 AppImage needs libfuse.so.2 (fuse-libs)"
+      if ! install_packages fuse-libs; then
+        fuse_fallback=1
+        log warn "fuse-libs unavailable; Exec will use --appimage-extract-and-run"
+      fi
+    fi
+    if ! has_libfuse2; then
+      fuse_fallback=1
+      log warn "libfuse.so.2 still missing; using --appimage-extract-and-run"
+    fi
+  fi
+
+  local work
+  work="$(mktemp -d "${WORK_ROOT}/ex.XXXXXX")"
+  if ! extract_appimage "${appimage}" "${work}"; then
+    log error "extract failed: ${base}"
+    rm -rf "${work}"
+    return 1
+  fi
+  local root="${work}/squashfs-root"
+
+  local src_desktop=""
+  src_desktop="$(find_root_desktops "${root}" | head -n 1 || true)"
+
+  local orig_name orig_icon orig_exec orig_wmclass orig_cats
+  orig_name=""
+  orig_icon=""
+  orig_exec=""
+  orig_wmclass=""
+  orig_cats=""
+  if [[ -n "${src_desktop}" ]]; then
+    orig_name="$(awk -F= '/^\[Desktop Entry\]/{inside=1;next} /^\[/{inside=0} inside && /^Name=/{print substr($0,index($0,"=")+1); exit}' "${src_desktop}")"
+    orig_icon="$(awk -F= '/^\[Desktop Entry\]/{inside=1;next} /^\[/{inside=0} inside && /^Icon=/{print substr($0,index($0,"=")+1); exit}' "${src_desktop}")"
+    orig_exec="$(awk -F= '/^\[Desktop Entry\]/{inside=1;next} /^\[/{inside=0} inside && /^Exec=/{print substr($0,index($0,"=")+1); exit}' "${src_desktop}")"
+    orig_wmclass="$(awk -F= '/^\[Desktop Entry\]/{inside=1;next} /^\[/{inside=0} inside && /^StartupWMClass=/{print substr($0,index($0,"=")+1); exit}' "${src_desktop}")"
+    orig_cats="$(awk -F= '/^\[Desktop Entry\]/{inside=1;next} /^\[/{inside=0} inside && /^Categories=/{print substr($0,index($0,"=")+1); exit}' "${src_desktop}")"
+  fi
+  orig_icon="$(basename "${orig_icon}")"
+
+  local app_id
+  if [[ -n "${orig_icon}" && "${orig_icon}" != application-* ]]; then
+    app_id="$(slugify "${orig_icon}")"
+  elif [[ -n "${orig_wmclass}" ]]; then
+    app_id="$(slugify "${orig_wmclass}")"
+  elif [[ -n "${orig_name}" ]]; then
+    app_id="$(slugify "${orig_name}")"
+  else
+    app_id="$(slugify "$(stem_without_version "${base}")")"
+  fi
+  [[ -n "${app_id}" ]] || app_id="app"
+
+  local display_name="${orig_name}"
+  [[ -n "${display_name}" ]] || display_name="$(humanize_stem "$(stem_without_version "${base}")")"
+
+  local p
+  local common_status=()
+  for p in "${COMMON_PKGS[@]}"; do
+    if pkg_installed "${p}"; then
+      common_status+=("${p}=yes")
+    else
+      common_status+=("${p}=no")
+    fi
+  done
+  log info "common packages: ${common_status[*]}"
+
+  local main_bin
+  main_bin="$(find_main_binary "${root}" "${src_desktop}")"
+
+  local missing_libs=()
+  local so
+  while IFS= read -r so; do
+    [[ -n "${so}" ]] && missing_libs+=("${so}")
+  done < <(collect_missing_libs "${root}" "${main_bin}")
+
+  if (( ${#missing_libs[@]} )); then
+    log info "ldd not-found: ${missing_libs[*]}"
+    local pkgs=() mapped
+    for so in "${missing_libs[@]}"; do
+      mapped="$(map_soname_to_pkg "${so}" || true)"
+      if [[ -n "${mapped}" ]]; then
+        pkgs+=("${mapped}")
+      else
+        log warn "no Fedora package mapped for ${so}"
+      fi
+    done
+    if (( ${#pkgs[@]} )); then
+      mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u)
+      install_packages "${pkgs[@]}" || log warn "continuing without all mapped packages"
+    fi
+  else
+    log info "no missing system libraries from ldd (bundled libs resolved)"
+  fi
+
+  # Common packages: check first, install only if a mapped missing lib needs them
+  # (already handled via SO_TO_PKG). Also ensure xdg-utils if xdg-open is absent.
+  if ! command -v xdg-open >/dev/null 2>&1; then
+    install_packages xdg-utils || true
+  fi
+
+  local field_codes=""
+  if [[ "${orig_exec}" =~ (%[fFuUdDnNickvm]) ]]; then
+    field_codes="$(printf '%s\n' "${orig_exec}" | grep -oE '%[fFuUdDnNickvm]' | awk '!seen[$0]++' | tr '\n' ' ')"
+    field_codes="${field_codes% }"
+  elif grep -q '^MimeType=' "${src_desktop}" 2>/dev/null; then
+    field_codes="%U"
+  fi
+
+  local exec_args=""
+  if (( fuse_fallback )); then
+    exec_args+=" --appimage-extract-and-run"
+  fi
+
+  local is_el=0
+  if detect_electron "${root}" "${src_desktop}"; then
+    is_el=1
+    if user_ns_ok; then
+      log info "Electron app; user namespaces work, not adding --no-sandbox"
+    else
+      log warn "Electron app; user namespaces unavailable, adding --no-sandbox"
+      exec_args+=" --no-sandbox"
+    fi
+  fi
+
+  local exec_line
+  exec_line="$(quote_exec_path "${appimage}")${exec_args}"
+  [[ -n "${field_codes}" ]] && exec_line="${exec_line} ${field_codes}"
+
+  local icon_name="appimage-${app_id}"
+  local icons_joined
+  icons_joined="$(install_icons "${root}" "${orig_icon}" "${icon_name}")"
+  if [[ -z "${icons_joined}" ]]; then
+    icon_name="application-x-executable"
+  fi
+
+  local dest_desktop="${DESKTOP_DIR}/appimage-${app_id}.desktop"
+  local gen_src="${src_desktop}"
+  if [[ -z "${gen_src}" ]]; then
+    gen_src="${work}/generated.desktop"
+    cat >"${gen_src}" <<EOF
+[Desktop Entry]
+Type=Application
+Name=${display_name}
+Exec=placeholder
+Icon=${icon_name}
+Terminal=false
+Categories=${orig_cats:-Utility;}
+StartupNotify=true
+EOF
+  fi
+
+  rewrite_desktop "${gen_src}" "${dest_desktop}" "${exec_line}" "${icon_name}" "${appimage}"
+  chmod 644 "${dest_desktop}"
+
+  if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "${dest_desktop}" >/dev/null 2>&1 || \
+      log warn "desktop-file-validate warnings for ${dest_desktop}"
+  fi
+
+  # Same app_id, older files: keep files, one launcher pointing at newest.
+  local other
+  while IFS= read -r other; do
+    [[ -n "${other}" && "${other}" != "${appimage}" ]] || continue
+    log info "app ${app_id} also present as $(basename "${other}"); launcher tracks newest mtime"
+  done < <(state_paths_for_app "${app_id}")
+
+  state_upsert "${appimage}" "${app_id}" "${size}" "${mtime}" "${dest_desktop}" "${icons_joined}"
+  point_launcher_at_newest "${app_id}"
+
+  refresh_desktop_and_icons
+  log info "integrated ${base} as ${dest_desktop} (icon ${icon_name})"
+  notify "AppImage installed" "${display_name} is in the app launcher"
+
+  if [[ "${SMOKE_TEST}" == "1" ]]; then
+    log info "SMOKE_TEST=1: running --appimage-version"
+    timeout 8 "${appimage}" --appimage-version >/dev/null 2>&1 || \
+      log warn "smoke test (runtime version) failed"
+  fi
+
+  rm -rf "${work}"
+  return 0
+}
+
+point_launcher_at_newest() {
+  local app_id="$1"
+  local newest="" newest_mtime=0 path mtime desktop icons size exec_line
+  while IFS=$'\t' read -r path _ size mtime desktop icons; do
+    [[ -f "${path}" ]] || continue
+    if (( mtime >= newest_mtime )); then
+      newest="${path}"
+      newest_mtime="${mtime}"
+    fi
+  done < <(state_lines | awk -F'\t' -v a="${app_id}" '$2 == a {print}')
+  [[ -n "${newest}" ]] || return 0
+  local dest="${DESKTOP_DIR}/appimage-${app_id}.desktop"
+  [[ -f "${dest}" ]] || return 0
+
+  local extra=""
+  if grep -q -- '--appimage-extract-and-run' "${dest}"; then
+    extra+=" --appimage-extract-and-run"
+  fi
+  if grep -q -- '--no-sandbox' "${dest}"; then
+    extra+=" --no-sandbox"
+  fi
+  local codes=""
+  codes="$(grep -E '^Exec=' "${dest}" | grep -oE '%[fFuUdDnNickvm]' | awk '!seen[$0]++' | tr '\n' ' ')"
+  codes="${codes% }"
+  exec_line="$(quote_exec_path "${newest}")${extra}"
+  [[ -n "${codes}" ]] && exec_line="${exec_line} ${codes}"
+
+  python3 - "${dest}" "${exec_line}" "${newest}" <<'PY'
+from pathlib import Path
+import sys
+dest, exec_line, path = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = Path(dest).read_text(encoding="utf-8", errors="replace").splitlines()
+out = []
+for line in lines:
+    if line.startswith("Exec="):
+        out.append("Exec=" + exec_line)
+    elif line.startswith("TryExec="):
+        out.append("TryExec=" + path)
+    elif line.startswith("X-AppImage-Path="):
+        out.append("X-AppImage-Path=" + path)
+    else:
+        out.append(line)
+Path(dest).write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+}
+
+handle_delete() {
+  local appimage="$1"
+  local cached app_id icons
+  cached="$(state_lines | awk -F'\t' -v p="${appimage}" '$1 == p {print; exit}')"
+  if [[ -z "${cached}" ]]; then
+    # File vanished before we tracked it; still drop a matching launcher if any.
+    return 0
+  fi
+  app_id="$(awk -F'\t' '{print $2}' <<<"${cached}")"
+  icons="$(awk -F'\t' '{print $6}' <<<"${cached}")"
+  state_delete_path "${appimage}"
+  local remaining=0
+  remaining="$(state_paths_for_app "${app_id}" | grep -c . || true)"
+  if (( remaining == 0 )); then
+    remove_app_integration "${app_id}" "${icons}"
+    refresh_desktop_and_icons
+    notify "AppImage removed" "$(basename "${appimage}") launcher entry removed"
+  else
+    point_launcher_at_newest "${app_id}"
+    refresh_desktop_and_icons
+    log info "removed ${appimage}; ${remaining} other version(s) of ${app_id} remain"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Reconcile
+# ---------------------------------------------------------------------------
+
+list_watch_appimages() {
+  local f
+  shopt -s nullglob
+  for f in "${WATCH_DIR}"/*; do
+    [[ -f "${f}" || -L "${f}" ]] || continue
+    local base
+    base="$(basename "${f}")"
+    is_appimage_name "${base}" || continue
+    is_partial_name "${base}" && continue
+    printf '%s\n' "${f}"
+  done
+  shopt -u nullglob
+}
+
+reconcile() {
+  rotate_log
+  mkdir -p "${WATCH_DIR}"
+  log info "reconcile start (${WATCH_DIR})"
+
+  local current=()
+  local f
+  while IFS= read -r f; do
+    current+=("${f}")
+  done < <(list_watch_appimages)
+
+  local stated_path
+  while IFS= read -r stated_path; do
+    [[ -n "${stated_path}" ]] || continue
+    local still=0
+    for f in "${current[@]+"${current[@]}"}"; do
+      [[ "${f}" == "${stated_path}" ]] && still=1 && break
+    done
+    if (( still == 0 )); then
+      log info "detected removal: ${stated_path}"
+      handle_delete "${stated_path}"
+    fi
+  done < <(state_lines | awk -F'\t' '{print $1}')
+
+  for f in "${current[@]+"${current[@]}"}"; do
+    if ! wait_until_stable "${f}"; then
+      log warn "skipping unstable file: ${f}"
+      continue
+    fi
+    process_appimage "${f}" || log error "failed to process ${f}"
+  done
+  log info "reconcile done"
+}
+
+with_lock() {
+  mkdir -p "${STATE_DIR}"
+  (
+    flock -w 120 9 || { log warn "could not acquire lock"; exit 1; }
+    "$@"
+  ) 9>"${LOCK_FILE}"
+}
+
+handle_event() {
+  local events="$1" path="$2"
+  [[ -n "${path}" ]] || return 0
+  local base
+  base="$(basename "${path}")"
+  log info "event ${events}: ${base}"
+
+  if [[ "${events}" == *DELETE* || "${events}" == *MOVED_FROM* ]]; then
+    with_lock handle_delete "${path}" || true
+    # A MOVED_FROM inside the dir is followed by MOVED_TO; reconcile later too.
+    if [[ "${events}" == *MOVED_FROM* ]]; then
+      sleep 1
+      with_lock reconcile || true
+    fi
+    return 0
+  fi
+
+  is_appimage_name "${base}" || return 0
+  is_partial_name "${base}" && return 0
+  wait_until_stable "${path}" || return 0
+  with_lock process_appimage "${path}" || log error "process failed: ${path}"
+}
+
+watch_with_inotify() {
+  log info "watching ${WATCH_DIR} with inotifywait"
+  local events path
+  while true; do
+    while IFS='|' read -r events path; do
+      handle_event "${events}" "${path}" || true
+    done < <(inotifywait -m -q --format '%e|%w%f' \
+              -e close_write,moved_to,moved_from,delete,create \
+              "${WATCH_DIR}" 2>/dev/null)
+    log warn "inotifywait exited; restarting in 3s"
+    sleep 3
+  done
+}
+
+watch_with_poll() {
+  log info "watching ${WATCH_DIR} with poll (inotifywait not available)"
+  local snap="" now
+  while true; do
+    now="$(list_watch_appimages | awk '{print; system("stat -c %s-%Y " $0)}' 2>/dev/null || list_watch_appimages)"
+    if [[ "${now}" != "${snap}" ]]; then
+      snap="${now}"
+      with_lock reconcile || true
+    fi
+    sleep 2
+  done
+}
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+appimage-watcher ${VERSION}
+
+Usage:
+  appimage-watcher --watch          Watch ~/Apps (default)
+  appimage-watcher --reconcile      Process current folder once
+  appimage-watcher --process FILE   Integrate one AppImage
+  appimage-watcher --status         Show state
+  appimage-watcher --help
+
+Config: ${CONFIG_FILE}
+Log:    ${LOG_FILE}
+EOF
+}
+
+show_status() {
+  echo "watch dir: ${WATCH_DIR}"
+  echo "state:     ${STATE_FILE}"
+  echo "log:       ${LOG_FILE}"
+  echo "libfuse2:  $(has_libfuse2 && echo yes || echo no)"
+  echo "selinux:   $(getenforce 2>/dev/null || echo unknown)"
+  echo "smoke:     ${SMOKE_TEST}"
+  echo
+  echo "tracked AppImages:"
+  state_lines | awk -F'\t' '{printf "  %s\n    id=%s desktop=%s\n", $1, $2, $5}'
+}
+
+main() {
+  load_config
+  rotate_log
+  local cmd="${1:---watch}"
+  case "${cmd}" in
+    --help|-h) usage; exit 0 ;;
+    --version) echo "${VERSION}"; exit 0 ;;
+    --status) show_status; exit 0 ;;
+    --process)
+      [[ -n "${2:-}" ]] || { echo "FILE required"; exit 2; }
+      wait_until_stable "$2" || true
+      with_lock process_appimage "$2"
+      ;;
+    --reconcile|--scan)
+      with_lock reconcile
+      ;;
+    --watch)
+      log info "appimage-watcher ${VERSION} starting (user=$(id -un) watch=${WATCH_DIR})"
+      with_lock reconcile || true
+      if command -v inotifywait >/dev/null 2>&1; then
+        watch_with_inotify
+      else
+        log warn "inotifywait missing; using poll fallback. Install inotify-tools."
+        watch_with_poll
+      fi
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

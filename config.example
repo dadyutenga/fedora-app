@@ -1,0 +1,14 @@
+# Copy to ~/.config/appimage-watcher/config and uncomment to change.
+
+# Directory to watch (default: ~/Apps)
+# WATCH_DIR=/home/dadi/Apps
+
+# Seconds the file size must stay unchanged before processing (slow copies)
+# STABLE_SECONDS=3
+
+# Set to 1 to run `AppImage --appimage-version` after integration.
+# Never launches the GUI. Default: 0
+# SMOKE_TEST=0
+
+# Set to 0 to skip pkexec/dnf installs (still chmod + integrate)
+# INSTALL_DEPS=1

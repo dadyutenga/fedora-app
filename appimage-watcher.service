@@ -1,0 +1,16 @@
+[Unit]
+Description=AppImage auto-installer for ~/Apps
+Documentation=file://%h/.local/share/appimage-watcher/README.md
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/appimage-watcher --watch
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=%h/Apps
+SyslogIdentifier=appimage-watcher
+# Session bus / display are imported by the GNOME user instance.
+
+[Install]
+WantedBy=default.target
